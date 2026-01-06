@@ -1,561 +1,253 @@
-{
-  "nbformat": 4,
-  "nbformat_minor": 0,
-  "metadata": {
-    "colab": {
-      "provenance": [],
-      "authorship_tag": "ABX9TyOvVoDeCclmZBw3azFI7WcK"
-    },
-    "kernelspec": {
-      "name": "python3",
-      "display_name": "Python 3"
-    },
-    "language_info": {
-      "name": "python"
-    }
-  },
-  "cells": [
-    {
-      "cell_type": "code",
-      "execution_count": 1,
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "BMOF0mx85HGo",
-        "outputId": "a9a41fe9-7709-48ed-caa4-d88ccb7a1fa8"
-      },
-      "outputs": [
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# Backtester
+# ============================================================
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    execution_lag_days: int = 1   # target[t] -> position[t+lag]
+    cost_bps: float = 0.0         # linear cost on turnover: (bps/10000) * abs(trade)
+    events_df: Optional[pd.DataFrame] = None  # optional: asset, entry_date, exit_date (+ optional event_id/group/quintile/side)
+
+
+def run_backtest(
+    targets_df: pd.DataFrame,
+    returns_df: pd.DataFrame,
+    cfg: BacktestConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    """
+    targets_df:
+      index: MultiIndex(['date','asset']), col: 'target' (float weights)
+    returns_df:
+      index: MultiIndex(['date','asset']), col: 'ret' (float returns)
+    outputs:
+      positions_df: index ['date','asset'], col 'position'
+      trades_df:    index ['date','asset'], cols ['trade','turnover_abs','cost']
+      pnl_df:       index ['date'], cols ['gross_pnl','cost','net_pnl','turnover','cum_net_pnl']
+      event_summary_df (optional)
+    """
+
+    targets = targets_df[["target"]].copy()
+    rets = returns_df[["ret"]].copy()
+
+    if targets.index.names != ["date", "asset"] or rets.index.names != ["date", "asset"]:
+        raise ValueError("targets_df and returns_df must have MultiIndex names ['date','asset']")
+
+    # normalize date dtype + sort
+    targets = targets.reset_index()
+    rets = rets.reset_index()
+    targets["date"] = pd.to_datetime(targets["date"])
+    rets["date"] = pd.to_datetime(rets["date"])
+    targets = targets.set_index(["date", "asset"]).sort_index()
+    rets = rets.set_index(["date", "asset"]).sort_index().dropna(subset=["ret"])
+
+    # align targets to returns grid (missing targets -> 0)
+    targets = targets.reindex(rets.index).fillna({"target": 0.0})
+
+    # 1) targets -> positions (apply execution lag)
+    positions_df = targets.rename(columns={"target": "position"}).copy()
+    if cfg.execution_lag_days > 0:
+        positions_df["position"] = positions_df.groupby(level="asset")["position"].shift(cfg.execution_lag_days)
+    positions_df["position"] = positions_df["position"].fillna(0.0)
+
+    # 2) positions -> trades (delta positions)
+    prev_pos = positions_df.groupby(level="asset")["position"].shift(1).fillna(0.0)
+    trades_df = positions_df.copy()
+    trades_df["trade"] = trades_df["position"] - prev_pos
+    trades_df["turnover_abs"] = trades_df["trade"].abs()
+    trades_df["cost"] = (cfg.cost_bps / 10000.0) * trades_df["turnover_abs"]
+    trades_df = trades_df[["trade", "turnover_abs", "cost"]]
+
+    # 3) PnL accounting: gross_pnl[t] = sum_a position[a, t-1] * ret[a, t]
+    pos_for_pnl = positions_df.groupby(level="asset")["position"].shift(1).fillna(0.0)
+    pnl_panel = rets.copy()
+    pnl_panel["pos_for_pnl"] = pos_for_pnl.reindex(rets.index).fillna(0.0)
+    pnl_panel["gross_contrib"] = pnl_panel["pos_for_pnl"] * pnl_panel["ret"]
+
+    gross_pnl = pnl_panel.groupby(level="date")["gross_contrib"].sum()
+    daily_cost = trades_df.groupby(level="date")["cost"].sum()
+    daily_turnover = trades_df.groupby(level="date")["turnover_abs"].sum()
+
+    dates = gross_pnl.index.union(daily_cost.index).union(daily_turnover.index)
+    pnl_df = pd.DataFrame(
         {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "                  target\n",
-            "date       asset        \n",
-            "2024-01-02 AAPL     0.02\n",
-            "           MSFT    -0.02\n",
-            "           GOOG     0.00\n",
-            "2024-01-03 AAPL     0.02\n",
-            "           MSFT    -0.02\n",
-            "           GOOG     0.00\n",
-            "2024-01-04 AAPL     0.00\n",
-            "           MSFT     0.00\n",
-            "           GOOG     0.00\n"
-          ]
-        }
-      ],
-      "source": [
-        "import pandas as pd\n",
-        "\n",
-        "# construct a MultiIndex: [date, asset]\n",
-        "index = pd.MultiIndex.from_tuples(\n",
-        "    [\n",
-        "        (\"2024-01-02\", \"AAPL\"),\n",
-        "        (\"2024-01-02\", \"MSFT\"),\n",
-        "        (\"2024-01-02\", \"GOOG\"),\n",
-        "        (\"2024-01-03\", \"AAPL\"),\n",
-        "        (\"2024-01-03\", \"MSFT\"),\n",
-        "        (\"2024-01-03\", \"GOOG\"),\n",
-        "        (\"2024-01-04\", \"AAPL\"),\n",
-        "        (\"2024-01-04\", \"MSFT\"),\n",
-        "        (\"2024-01-04\", \"GOOG\"),\n",
-        "    ],\n",
-        "    names=[\"date\", \"asset\"],\n",
-        ")\n",
-        "\n",
-        "# example target weights\n",
-        "targets_df = pd.DataFrame(\n",
-        "    {\n",
-        "        \"target\": [\n",
-        "            0.02,   # AAPL long 2%\n",
-        "           -0.02,   # MSFT short 2%\n",
-        "            0.00,   # GOOG flat\n",
-        "            0.02,\n",
-        "           -0.02,\n",
-        "            0.00,\n",
-        "            0.00,   # position exited\n",
-        "            0.00,\n",
-        "            0.00,\n",
-        "        ]\n",
-        "    },\n",
-        "    index=index,\n",
-        ")\n",
-        "\n",
-        "# ensure date is datetime (recommended)\n",
-        "targets_df = targets_df.reset_index()\n",
-        "targets_df[\"date\"] = pd.to_datetime(targets_df[\"date\"])\n",
-        "targets_df = targets_df.set_index([\"date\", \"asset\"])\n",
-        "\n",
-        "print(targets_df)\n"
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "from __future__ import annotations\n",
-        "\n",
-        "from dataclasses import dataclass\n",
-        "from typing import Optional, Literal, Tuple\n",
-        "import pandas as pd\n",
-        "\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Config\n",
-        "# -----------------------------\n",
-        "\n",
-        "@dataclass(frozen=True)\n",
-        "class BacktestConfig:\n",
-        "    # timing\n",
-        "    execution_lag_days: int = 1  # target[t] -> position[t+lag]\n",
-        "    # costs\n",
-        "    cost_bps: float = 0.0        # simple linear cost on turnover (abs(trade))\n",
-        "    # events (optional)\n",
-        "    events_df: Optional[pd.DataFrame] = None\n",
-        "    # required cols if events_df is provided: asset, entry_date, exit_date\n",
-        "    # optional: event_id, group/quintile/side\n",
-        "\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Main backtest function\n",
-        "# -----------------------------\n",
-        "\n",
-        "def run_backtest(\n",
-        "    targets_df: pd.DataFrame,\n",
-        "    returns_df: pd.DataFrame,\n",
-        "    cfg: BacktestConfig,\n",
-        ") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:\n",
-        "    \"\"\"\n",
-        "    Inputs\n",
-        "    ------\n",
-        "    targets_df:\n",
-        "      - index: MultiIndex(['date','asset'])\n",
-        "      - columns: ['target'] (float), desired portfolio weight\n",
-        "      - note: missing (date,asset) rows are treated as target=0\n",
-        "\n",
-        "    returns_df:\n",
-        "      - index: MultiIndex(['date','asset'])\n",
-        "      - columns: ['ret'] (float), realized return for that date\n",
-        "      - note: PnL uses returns_df as the \"tradable grid\"\n",
-        "\n",
-        "    cfg:\n",
-        "      - execution_lag_days: apply lag to targets when forming positions\n",
-        "      - cost_bps: cost = (bps/10000) * abs(trade)\n",
-        "      - events_df (optional): event summary computed by slicing pnl\n",
-        "\n",
-        "    Outputs\n",
-        "    -------\n",
-        "    positions_df:\n",
-        "      - index: MultiIndex(['date','asset'])\n",
-        "      - columns: ['position'] (float), realized held weight after lag\n",
-        "\n",
-        "    trades_df:\n",
-        "      - index: MultiIndex(['date','asset'])\n",
-        "      - columns: ['trade','turnover_abs','cost']\n",
-        "\n",
-        "    pnl_df:\n",
-        "      - index: DatetimeIndex(['date'])\n",
-        "      - columns: ['gross_pnl','cost','net_pnl','turnover','cum_net_pnl']\n",
-        "\n",
-        "    event_summary_df (optional):\n",
-        "      - index: event_id (if provided) else RangeIndex\n",
-        "      - columns: ['asset','entry_date','exit_date','gross_return','net_return','cost', optional group/quintile/side]\n",
-        "    \"\"\"\n",
-        "\n",
-        "    # --- 0) minimal format assumptions ---\n",
-        "    # Use returns_df index as the master grid; reindex targets onto it\n",
-        "    # (If targets missing: assume 0; if returns missing: drop)\n",
-        "    targets = targets_df[[\"target\"]].copy()\n",
-        "    rets = returns_df[[\"ret\"]].copy()\n",
-        "\n",
-        "    # coerce date index level to datetime (common pitfall)\n",
-        "    if targets.index.names != [\"date\", \"asset\"] or rets.index.names != [\"date\", \"asset\"]:\n",
-        "        raise ValueError(\"targets_df and returns_df must have MultiIndex names ['date','asset']\")\n",
-        "\n",
-        "    targets = targets.reset_index()\n",
-        "    rets = rets.reset_index()\n",
-        "    targets[\"date\"] = pd.to_datetime(targets[\"date\"])\n",
-        "    rets[\"date\"] = pd.to_datetime(rets[\"date\"])\n",
-        "    targets = targets.set_index([\"date\", \"asset\"]).sort_index()\n",
-        "    rets = rets.set_index([\"date\", \"asset\"]).sort_index()\n",
-        "    rets = rets.dropna(subset=[\"ret\"])\n",
-        "\n",
-        "    # align targets to returns grid (missing targets -> 0)\n",
-        "    targets = targets.reindex(rets.index).fillna({\"target\": 0.0})\n",
-        "\n",
-        "    # --- 1) targets -> positions (apply execution lag) ---\n",
-        "    positions_df = targets.rename(columns={\"target\": \"position\"}).copy()\n",
-        "    if cfg.execution_lag_days > 0:\n",
-        "        positions_df[\"position\"] = (\n",
-        "            positions_df.groupby(level=\"asset\")[\"position\"].shift(cfg.execution_lag_days)\n",
-        "        )\n",
-        "    positions_df[\"position\"] = positions_df[\"position\"].fillna(0.0)\n",
-        "\n",
-        "    # --- 2) positions -> trades (delta by asset) ---\n",
-        "    prev_pos = positions_df.groupby(level=\"asset\")[\"position\"].shift(1).fillna(0.0)\n",
-        "    trades_df = positions_df.copy()\n",
-        "    trades_df[\"trade\"] = trades_df[\"position\"] - prev_pos\n",
-        "    trades_df[\"turnover_abs\"] = trades_df[\"trade\"].abs()\n",
-        "    trades_df[\"cost\"] = (cfg.cost_bps / 10000.0) * trades_df[\"turnover_abs\"]\n",
-        "    trades_df = trades_df[[\"trade\", \"turnover_abs\", \"cost\"]]\n",
-        "\n",
-        "    # --- 3) compute PnL (hold position over return interval) ---\n",
-        "    # Accounting convention used here:\n",
-        "    #   gross_pnl[t] = sum_a position[a, t-1] * ret[a, t]\n",
-        "    pos_for_pnl = positions_df.groupby(level=\"asset\")[\"position\"].shift(1).fillna(0.0)\n",
-        "    pnl_panel = rets.copy()\n",
-        "    pnl_panel[\"pos_for_pnl\"] = pos_for_pnl.reindex(rets.index).fillna(0.0)\n",
-        "    pnl_panel[\"gross_contrib\"] = pnl_panel[\"pos_for_pnl\"] * pnl_panel[\"ret\"]\n",
-        "\n",
-        "    gross_pnl = pnl_panel.groupby(level=\"date\")[\"gross_contrib\"].sum()\n",
-        "    daily_cost = trades_df.groupby(level=\"date\")[\"cost\"].sum()\n",
-        "    daily_turnover = trades_df.groupby(level=\"date\")[\"turnover_abs\"].sum()\n",
-        "\n",
-        "    # ensure same date index\n",
-        "    dates = gross_pnl.index.union(daily_cost.index).union(daily_turnover.index)\n",
-        "    pnl_df = pd.DataFrame(\n",
-        "        {\n",
-        "            \"gross_pnl\": gross_pnl.reindex(dates, fill_value=0.0),\n",
-        "            \"cost\": daily_cost.reindex(dates, fill_value=0.0),\n",
-        "            \"turnover\": daily_turnover.reindex(dates, fill_value=0.0),\n",
-        "        },\n",
-        "        index=dates,\n",
-        "    )\n",
-        "    pnl_df.index.name = \"date\"\n",
-        "    pnl_df[\"net_pnl\"] = pnl_df[\"gross_pnl\"] - pnl_df[\"cost\"]\n",
-        "    pnl_df[\"cum_net_pnl\"] = pnl_df[\"net_pnl\"].cumsum()\n",
-        "\n",
-        "    # --- 4) optional event summary ---\n",
-        "    event_summary_df = None\n",
-        "    if cfg.events_df is not None and len(cfg.events_df) > 0:\n",
-        "        event_summary_df = _event_summary(cfg.events_df, pnl_panel, trades_df)\n",
-        "\n",
-        "    return positions_df, trades_df, pnl_df, event_summary_df\n",
-        "\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Event summary helper (kept simple)\n",
-        "# -----------------------------\n",
-        "\n",
-        "def _event_summary(\n",
-        "    events_df: pd.DataFrame,\n",
-        "    pnl_panel: pd.DataFrame,\n",
-        "    trades_df: pd.DataFrame,\n",
-        ") -> pd.DataFrame:\n",
-        "    \"\"\"\n",
-        "    events_df required columns: asset, entry_date, exit_date\n",
-        "    optional: event_id, group/quintile/side\n",
-        "\n",
-        "    We compute per-event:\n",
-        "      gross_return = sum gross_contrib over (entry_date..exit_date) for that asset\n",
-        "      cost         = sum costs over the same window for that asset\n",
-        "      net_return   = gross_return - cost\n",
-        "    \"\"\"\n",
-        "\n",
-        "    ev = events_df.copy()\n",
-        "\n",
-        "    # standardize dates\n",
-        "    ev[\"entry_date\"] = pd.to_datetime(ev[\"entry_date\"])\n",
-        "    ev[\"exit_date\"] = pd.to_datetime(ev[\"exit_date\"])\n",
-        "\n",
-        "    if \"event_id\" not in ev.columns:\n",
-        "        ev = ev.reset_index(drop=True)\n",
-        "        ev[\"event_id\"] = range(len(ev))\n",
-        "    ev = ev.set_index(\"event_id\", drop=False)\n",
-        "\n",
-        "    out_rows = []\n",
-        "    for _, r in ev.iterrows():\n",
-        "        asset = r[\"asset\"]\n",
-        "        start = r[\"entry_date\"]\n",
-        "        end = r[\"exit_date\"]\n",
-        "\n",
-        "        # slice pnl_panel and trades for this asset and date window\n",
-        "        pnl_slice = pnl_panel.xs(asset, level=\"asset\", drop_level=False)\n",
-        "        pnl_slice = pnl_slice.loc[(pnl_slice.index.get_level_values(\"date\") >= start) &\n",
-        "                                  (pnl_slice.index.get_level_values(\"date\") <= end)]\n",
-        "        gross = float(pnl_slice[\"gross_contrib\"].sum())\n",
-        "\n",
-        "        tr_slice = trades_df.xs(asset, level=\"asset\", drop_level=False)\n",
-        "        tr_slice = tr_slice.loc[(tr_slice.index.get_level_values(\"date\") >= start) &\n",
-        "                                (tr_slice.index.get_level_values(\"date\") <= end)]\n",
-        "        cost = float(tr_slice[\"cost\"].sum())\n",
-        "\n",
-        "        row = {\n",
-        "            \"asset\": asset,\n",
-        "            \"entry_date\": start,\n",
-        "            \"exit_date\": end,\n",
-        "            \"gross_return\": gross,\n",
-        "            \"net_return\": gross - cost,\n",
-        "            \"cost\": cost,\n",
-        "        }\n",
-        "        for c in [\"group\", \"quintile\", \"side\"]:\n",
-        "            if c in ev.columns:\n",
-        "                row[c] = r[c]\n",
-        "        out_rows.append((r[\"event_id\"], row))\n",
-        "\n",
-        "    event_summary_df = pd.DataFrame.from_dict(dict(out_rows), orient=\"index\")\n",
-        "    event_summary_df.index.name = \"event_id\"\n",
-        "    return event_summary_df\n"
-      ],
-      "metadata": {
-        "id": "mHp8rj7-81xK"
-      },
-      "execution_count": 2,
-      "outputs": []
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "import numpy as np\n",
-        "import pandas as pd\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Parameters\n",
-        "# -----------------------------\n",
-        "np.random.seed(42)\n",
-        "\n",
-        "assets = [\"AAPL\", \"MSFT\", \"GOOG\", \"AMZN\"]\n",
-        "dates = pd.date_range(\"2024-01-02\", periods=20, freq=\"B\")  # 20 trading days\n",
-        "\n",
-        "# build MultiIndex [date, asset]\n",
-        "index = pd.MultiIndex.from_product(\n",
-        "    [dates, assets],\n",
-        "    names=[\"date\", \"asset\"]\n",
-        ")\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Random returns_df\n",
-        "# -----------------------------\n",
-        "returns_df = pd.DataFrame(\n",
-        "    {\n",
-        "        # daily returns ~ N(0, 1%)\n",
-        "        \"ret\": np.random.normal(loc=0.0, scale=0.01, size=len(index))\n",
-        "    },\n",
-        "    index=index\n",
-        ")\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Random targets_df\n",
-        "# -----------------------------\n",
-        "# sparse random signals: most days flat, some days long/short\n",
-        "raw_targets = np.random.choice(\n",
-        "    [-0.02, 0.0, 0.02],\n",
-        "    size=len(index),\n",
-        "    p=[0.25, 0.50, 0.25]\n",
-        ")\n",
-        "\n",
-        "targets_df = pd.DataFrame(\n",
-        "    {\"target\": raw_targets},\n",
-        "    index=index\n",
-        ")\n",
-        "\n",
-        "# OPTIONAL: enforce market-neutral per day (nice for debugging)\n",
-        "def neutralize(group):\n",
-        "    s = group[\"target\"].sum()\n",
-        "    if s != 0:\n",
-        "        group[\"target\"] -= s / len(group)\n",
-        "    return group\n",
-        "\n",
-        "targets_df = targets_df.groupby(level=\"date\", group_keys=False).apply(neutralize)\n",
-        "\n",
-        "# -----------------------------\n",
-        "# Sanity check\n",
-        "# -----------------------------\n",
-        "print(\"targets_df head:\")\n",
-        "print(targets_df.head(8))\n",
-        "print(\"\\nreturns_df head:\")\n",
-        "print(returns_df.head(8))\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
+            "gross_pnl": gross_pnl.reindex(dates, fill_value=0.0),
+            "cost": daily_cost.reindex(dates, fill_value=0.0),
+            "turnover": daily_turnover.reindex(dates, fill_value=0.0),
         },
-        "id": "YQ86Qy8TAmDI",
-        "outputId": "231e425c-5bcc-405a-9224-6b5fe2974632"
-      },
-      "execution_count": 3,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "targets_df head:\n",
-            "                  target\n",
-            "date       asset        \n",
-            "2024-01-02 AAPL    0.015\n",
-            "           MSFT   -0.025\n",
-            "           GOOG   -0.005\n",
-            "           AMZN    0.015\n",
-            "2024-01-03 AAPL   -0.005\n",
-            "           MSFT   -0.005\n",
-            "           GOOG    0.015\n",
-            "           AMZN   -0.005\n",
-            "\n",
-            "returns_df head:\n",
-            "                       ret\n",
-            "date       asset          \n",
-            "2024-01-02 AAPL   0.004967\n",
-            "           MSFT  -0.001383\n",
-            "           GOOG   0.006477\n",
-            "           AMZN   0.015230\n",
-            "2024-01-03 AAPL  -0.002342\n",
-            "           MSFT  -0.002341\n",
-            "           GOOG   0.015792\n",
-            "           AMZN   0.007674\n"
-          ]
+        index=dates,
+    )
+    pnl_df.index.name = "date"
+    pnl_df["net_pnl"] = pnl_df["gross_pnl"] - pnl_df["cost"]
+    pnl_df["cum_net_pnl"] = pnl_df["net_pnl"].cumsum()
+
+    # 4) optional event summary
+    event_summary_df = None
+    if cfg.events_df is not None and len(cfg.events_df) > 0:
+        event_summary_df = _event_summary(cfg.events_df, pnl_panel, trades_df)
+
+    return positions_df, trades_df, pnl_df, event_summary_df
+
+
+def _event_summary(
+    events_df: pd.DataFrame,
+    pnl_panel: pd.DataFrame,
+    trades_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    events_df required: asset, entry_date, exit_date
+    optional: event_id, group/quintile/side
+
+    gross_return = sum gross_contrib over (entry_date..exit_date) for that asset
+    cost         = sum cost over (entry_date..exit_date) for that asset
+    net_return   = gross_return - cost
+    """
+    ev = events_df.copy()
+    ev["entry_date"] = pd.to_datetime(ev["entry_date"])
+    ev["exit_date"] = pd.to_datetime(ev["exit_date"])
+
+    if "event_id" not in ev.columns:
+        ev = ev.reset_index(drop=True)
+        ev["event_id"] = range(len(ev))
+    ev = ev.set_index("event_id", drop=False)
+
+    out_rows = []
+    for _, r in ev.iterrows():
+        asset = r["asset"]
+        start = r["entry_date"]
+        end = r["exit_date"]
+
+        pnl_slice = pnl_panel.xs(asset, level="asset", drop_level=False)
+        pnl_slice = pnl_slice.loc[
+            (pnl_slice.index.get_level_values("date") >= start)
+            & (pnl_slice.index.get_level_values("date") <= end)
+        ]
+        gross = float(pnl_slice["gross_contrib"].sum())
+
+        tr_slice = trades_df.xs(asset, level="asset", drop_level=False)
+        tr_slice = tr_slice.loc[
+            (tr_slice.index.get_level_values("date") >= start)
+            & (tr_slice.index.get_level_values("date") <= end)
+        ]
+        cost = float(tr_slice["cost"].sum())
+
+        row = {
+            "asset": asset,
+            "entry_date": start,
+            "exit_date": end,
+            "gross_return": gross,
+            "net_return": gross - cost,
+            "cost": cost,
         }
-      ]
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "import pandas as pd\n",
-        "\n",
-        "def make_returns_df_from_prices(\n",
-        "    targets_df: pd.DataFrame,\n",
-        "    prices_df: pd.DataFrame,\n",
-        "    *,\n",
-        "    price_col: str = \"close\",\n",
-        "    return_col: str = \"ret\",\n",
-        "    method: str = \"simple\",   # \"simple\" or \"log\"\n",
-        ") -> pd.DataFrame:\n",
-        "    \"\"\"\n",
-        "    Build returns_df aligned to targets_df's (date,asset) index\n",
-        "\n",
-        "    targets_df\n",
-        "      - index: MultiIndex ['date','asset']\n",
-        "      - col: 'target' (not used except for index)\n",
-        "\n",
-        "    prices_df\n",
-        "      - index: MultiIndex ['date','asset']\n",
-        "      - must contain column price_col (default 'close')\n",
-        "      - should include at least the dates needed to compute returns on the target dates\n",
-        "        (i.e., needs previous trading day prices per asset)\n",
-        "\n",
-        "    Output: returns_df\n",
-        "      - index: MultiIndex ['date','asset'] (same grid as targets_df)\n",
-        "      - columns: [return_col] (float)\n",
-        "      - note: first available date per asset will have NaN return (no prior price)\n",
-        "    \"\"\"\n",
-        "\n",
-        "    # 1) normalize index types + sort\n",
-        "    t = targets_df.copy()\n",
-        "    p = prices_df[[price_col]].copy()\n",
-        "\n",
-        "    if t.index.names != [\"date\", \"asset\"]:\n",
-        "        raise ValueError(\"targets_df index must be MultiIndex ['date','asset']\")\n",
-        "    if p.index.names != [\"date\", \"asset\"]:\n",
-        "        raise ValueError(\"prices_df index must be MultiIndex ['date','asset']\")\n",
-        "\n",
-        "    # coerce date to datetime\n",
-        "    t = t.reset_index()\n",
-        "    p = p.reset_index()\n",
-        "    t[\"date\"] = pd.to_datetime(t[\"date\"])\n",
-        "    p[\"date\"] = pd.to_datetime(p[\"date\"])\n",
-        "    t = t.set_index([\"date\", \"asset\"]).sort_index()\n",
-        "    p = p.set_index([\"date\", \"asset\"]).sort_index()\n",
-        "\n",
-        "    # 2) compute returns from prices (per asset)\n",
-        "    px = p[price_col]\n",
-        "    if method == \"simple\":\n",
-        "        ret = px.groupby(level=\"asset\").pct_change()\n",
-        "    elif method == \"log\":\n",
-        "        ret = (px.groupby(level=\"asset\").apply(lambda s: (s.apply(\"log\") if False else s))).copy()\n",
-        "        # simpler + correct log return:\n",
-        "        ret = (px.groupby(level=\"asset\").apply(lambda s: (s.pct_change() + 1).apply(lambda x: None if pd.isna(x) else x))).droplevel(0)\n",
-        "        # The above is too hacky; keep log optional out unless you really need it\n",
-        "        raise NotImplementedError(\"Use method='simple' for now (recommended)\")\n",
-        "    else:\n",
-        "        raise ValueError(\"method must be 'simple' or 'log'\")\n",
-        "\n",
-        "    all_returns = ret.to_frame(return_col)\n",
-        "\n",
-        "    # 3) align to targets grid\n",
-        "    # returns_df should be defined on the same (date,asset) pairs as targets_df\n",
-        "    returns_df = all_returns.reindex(t.index)\n",
-        "\n",
-        "    return returns_df\n"
-      ],
-      "metadata": {
-        "id": "cikcnPHuEdH0"
-      },
-      "execution_count": 6,
-      "outputs": []
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "import numpy as np\n",
-        "\n",
-        "# create fake prices on the same grid__implement dataloading from actual market prices\n",
-        "prices_df = targets_df.copy()\n",
-        "prices_df[\"close\"] = 100 * np.exp(np.random.normal(0, 0.01, size=len(prices_df))).cumprod()\n",
-        "\n",
-        "returns_df = make_returns_df_from_prices(targets_df, prices_df, price_col=\"close\")\n"
-      ],
-      "metadata": {
-        "id": "bQXYJVliEehM"
-      },
-      "execution_count": 7,
-      "outputs": []
-    },
-    {
-      "cell_type": "code",
-      "source": [
-        "cfg = BacktestConfig(\n",
-        "    execution_lag_days=1,\n",
-        "    cost_bps=5.0,  # 5 bps per unit turnover\n",
-        ")\n",
-        "\n",
-        "positions_df, trades_df, pnl_df, _ = run_backtest(\n",
-        "    targets_df=targets_df,\n",
-        "    returns_df=returns_df,\n",
-        "    cfg=cfg,\n",
-        ")\n",
-        "\n",
-        "print(pnl_df)\n",
-        "print(\"\\nTotal net PnL:\", pnl_df[\"net_pnl\"].sum())\n",
-        "print(\"Total turnover:\", pnl_df[\"turnover\"].sum())\n"
-      ],
-      "metadata": {
-        "colab": {
-          "base_uri": "https://localhost:8080/"
-        },
-        "id": "roHYtqEsBtrt",
-        "outputId": "ab687101-8bc6-4419-955b-c0bf0ec7aa6e"
-      },
-      "execution_count": 8,
-      "outputs": [
-        {
-          "output_type": "stream",
-          "name": "stdout",
-          "text": [
-            "            gross_pnl      cost  turnover   net_pnl  cum_net_pnl\n",
-            "date                                                            \n",
-            "2024-01-03   0.000000  0.000000      0.00  0.000000     0.000000\n",
-            "2024-01-04   0.000000  0.000015      0.03 -0.000015    -0.000015\n",
-            "2024-01-05  -0.000034  0.000030      0.06 -0.000064    -0.000079\n",
-            "2024-01-08  -0.000190  0.000040      0.08 -0.000230    -0.000310\n",
-            "2024-01-09  -0.000509  0.000040      0.08 -0.000549    -0.000858\n",
-            "2024-01-10  -0.000269  0.000060      0.12 -0.000329    -0.001187\n",
-            "2024-01-11   0.000144  0.000030      0.06  0.000114    -0.001074\n",
-            "2024-01-12  -0.000375  0.000020      0.04 -0.000395    -0.001469\n",
-            "2024-01-15   0.000349  0.000030      0.06  0.000319    -0.001150\n",
-            "2024-01-16  -0.000197  0.000020      0.04 -0.000217    -0.001367\n",
-            "2024-01-17   0.000343  0.000020      0.04  0.000323    -0.001044\n",
-            "2024-01-18  -0.000145  0.000040      0.08 -0.000185    -0.001229\n",
-            "2024-01-19   0.000201  0.000000      0.00  0.000201    -0.001029\n",
-            "2024-01-22  -0.000387  0.000045      0.09 -0.000432    -0.001461\n",
-            "2024-01-23  -0.000245  0.000020      0.04 -0.000265    -0.001726\n",
-            "2024-01-24   0.000000  0.000030      0.06 -0.000030    -0.001756\n",
-            "2024-01-25  -0.001009  0.000015      0.03 -0.001024    -0.002781\n",
-            "2024-01-26   0.000402  0.000020      0.04  0.000382    -0.002399\n",
-            "2024-01-29   0.000127  0.000020      0.04  0.000107    -0.002291\n",
-            "\n",
-            "Total net PnL: -0.0022914683239633107\n",
-            "Total turnover: 0.9900000000000001\n"
-          ]
-        }
-      ]
-    }
-  ]
-}
+        for c in ["group", "quintile", "side"]:
+            if c in ev.columns:
+                row[c] = r[c]
+        out_rows.append((r["event_id"], row))
+
+    out = pd.DataFrame.from_dict(dict(out_rows), orient="index")
+    out.index.name = "event_id"
+    return out
+
+
+# ============================================================
+# Utilities: returns from prices + random test data
+# ============================================================
+
+def make_returns_df_from_prices(
+    targets_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    *,
+    price_col: str = "close",
+    return_col: str = "ret",
+) -> pd.DataFrame:
+    """
+    prices_df: index ['date','asset'] with column price_col
+    output returns_df: index same as targets_df, column return_col
+    """
+    if targets_df.index.names != ["date", "asset"]:
+        raise ValueError("targets_df index must be MultiIndex ['date','asset']")
+    if prices_df.index.names != ["date", "asset"]:
+        raise ValueError("prices_df index must be MultiIndex ['date','asset']")
+
+    t = targets_df.reset_index()
+    p = prices_df[[price_col]].reset_index()
+    t["date"] = pd.to_datetime(t["date"])
+    p["date"] = pd.to_datetime(p["date"])
+    t = t.set_index(["date", "asset"]).sort_index()
+    p = p.set_index(["date", "asset"]).sort_index()
+
+    ret = p[price_col].groupby(level="asset").pct_change()
+    return ret.to_frame(return_col).reindex(t.index)
+
+
+def make_random_test_data(
+    *,
+    assets: list[str] = None,
+    start: str = "2024-01-02",
+    periods: int = 20,
+    freq: str = "B",
+    seed: int = 42,
+    ret_sigma: float = 0.01,
+    target_levels: tuple[float, ...] = (-0.02, 0.0, 0.02),
+    target_probs: tuple[float, ...] = (0.25, 0.50, 0.25),
+    market_neutralize: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns (targets_df, returns_df) on the same (date,asset) grid
+    """
+    if assets is None:
+        assets = ["AAPL", "MSFT", "GOOG", "AMZN"]
+
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range(start, periods=periods, freq=freq)
+    index = pd.MultiIndex.from_product([dates, assets], names=["date", "asset"])
+
+    returns_df = pd.DataFrame({"ret": rng.normal(0.0, ret_sigma, size=len(index))}, index=index)
+
+    raw_targets = rng.choice(list(target_levels), size=len(index), p=list(target_probs))
+    targets_df = pd.DataFrame({"target": raw_targets}, index=index)
+
+    if market_neutralize:
+        def neutralize(g: pd.DataFrame) -> pd.DataFrame:
+            s = g["target"].sum()
+            if s != 0:
+                g["target"] -= s / len(g)
+            return g
+        targets_df = targets_df.groupby(level="date", group_keys=False).apply(neutralize)
+
+    return targets_df.sort_index(), returns_df.sort_index()
+
+
+# ============================================================
+# Example usage
+# ============================================================
+
+if __name__ == "__main__":
+    # 1) generate random targets + returns to test engine mechanics
+    targets_df, returns_df = make_random_test_data()
+
+    # 2) (optional) instead generate returns from prices (replace with real market prices)
+    # prices_df = targets_df.copy()
+    # prices_df["close"] = 100 * np.exp(np.random.default_rng(0).normal(0, 0.01, size=len(prices_df))).cumprod()
+    # returns_df = make_returns_df_from_prices(targets_df, prices_df, price_col="close")
+
+    # 3) run backtest
+    cfg = BacktestConfig(execution_lag_days=1, cost_bps=5.0)
+    positions_df, trades_df, pnl_df, event_summary_df = run_backtest(targets_df, returns_df, cfg)
+
+    print("targets_df head:")
+    print(targets_df.head(8))
+    print("\nreturns_df head:")
+    print(returns_df.head(8))
+    print("\npnl_df head:")
+    print(pnl_df.head())
+    print("\nTotal net PnL:", pnl_df["net_pnl"].sum())
+    print("Total turnover:", pnl_df["turnover"].sum())
